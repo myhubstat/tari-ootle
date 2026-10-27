@@ -54,6 +54,8 @@ use tari_ootle_wallet_sdk::{
         AccountWithAddress,
         KeyBranch,
         NewAccountData,
+        OutputStatus,
+        StealthOutputModel,
         StealthUtxoSpendKeyId,
         TransactionContext,
         TransactionContextKind,
@@ -2105,10 +2107,14 @@ pub async fn handle_create_stealth_transfer_statement(
                     Some("total revealed output amount exceeds the maximum amount"),
                 )
             })?;
-        let outputs = req
+        let blinded_outputs = req
             .outputs
             .iter()
             .filter(|o| o.blinded_amount > 0)
+            .collect::<Vec<_>>();
+        let outputs = blinded_outputs
+            .iter()
+            .copied()
             .map(TryInto::try_into)
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -2139,6 +2145,45 @@ pub async fn handle_create_stealth_transfer_statement(
                 }),
             })
             .map_err(map_statement_construction_error)?;
+
+        for (requested, created) in blinded_outputs
+            .into_iter()
+            .zip(&statement.outputs_statement.outputs)
+        {
+            let dest_component = derive_component_address_from_public_key(
+                &ACCOUNT_TEMPLATE_ADDRESS,
+                requested.address.account_public_key(),
+            );
+            if let Some(dest_account) = sdk
+                .accounts_api()
+                .get_account_by_address(&dest_component)
+                .optional()? &&
+                dest_account.address() == &requested.address
+            {
+                sdk.stealth_outputs_api().add_output(&StealthOutputModel {
+                    owner_account: *dest_account.component_address(),
+                    resource_address: req.resource_address,
+                    commitment: created.output.commitment,
+                    value: requested.blinded_amount,
+                    sender_public_nonce: created.output.sender_public_nonce,
+                    view_only_key_id: dest_account.view_only_key_id(),
+                    owner_key_id: dest_account.owner_key_id(),
+                    encrypted_data: created.output.encrypted_data.clone(),
+                    tag_byte: created.tag,
+                    memo: requested.memo.clone(),
+                    auth: created.auth.clone(),
+                    minimum_value_promise: created.output.minimum_value_promise,
+                    status: OutputStatus::LockedUnconfirmed,
+                    is_burnt: false,
+                    is_frozen: false,
+                    is_on_chain: false,
+                    is_condition_spendable: sdk.stealth_outputs_api().is_spendable_auth(&created.auth),
+                    lock_id: Some(lock.id()),
+                    proven_up: None,
+                    spent_version: None,
+                })?;
+            }
+        }
 
         utxo_signers.extend(inputs.iter().flat_map(|i| &i.inputs).map(|i| StealthUtxoSpendKeyId {
             account_key_id: sender_key_id,
@@ -2580,7 +2625,7 @@ mod create_stealth_transfer_statement_handler_tests {
         WalletSdkConfig,
         apis::confidential_transfer::UtxoInputSelection,
         cipher_seed::CipherSeedRestore,
-        models::{EpochBirthday, KeyBranch, KeyId, OutputStatus, StealthOutputModel},
+        models::{EpochBirthday, KeyId},
     };
     use tari_ootle_wallet_sdk_services::{
         account_monitor::AccountMonitor,
@@ -2932,7 +2977,8 @@ mod create_stealth_transfer_statement_handler_tests {
         assert_eq!(response.utxo_signers[0].public_nonce, output_b.sender_public_nonce);
         assert_eq!(response.utxo_signers[1].public_nonce, output_a.sender_public_nonce);
 
-        // keep_locked was reached: both selected outputs remain LockedForSpend under the returned lock.
+        // keep_locked was reached: both selected outputs remain LockedForSpend under the returned lock,
+        // and the wallet-owned output created by the statement is recorded as LockedUnconfirmed under the same lock.
         for output in [&output_b, &output_a] {
             let stored = stored_output(&test, &output.commitment);
             assert!(
@@ -2942,6 +2988,13 @@ mod create_stealth_transfer_statement_handler_tests {
             );
             assert_eq!(stored.lock_id, Some(response.lock_id));
         }
+        let created = &response.statements[0].outputs_statement.outputs[0];
+        let stored_created = stored_output(&test, created.commitment());
+        assert!(matches!(stored_created.status, OutputStatus::LockedUnconfirmed));
+        assert_eq!(stored_created.lock_id, Some(response.lock_id));
+        assert_eq!(stored_created.value, 300);
+        assert!(!stored_created.is_on_chain);
+        assert!(stored_created.is_condition_spendable);
     }
 
     #[tokio::test]
