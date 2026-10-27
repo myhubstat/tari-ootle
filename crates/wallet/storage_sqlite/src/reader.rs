@@ -1057,48 +1057,16 @@ impl WalletStoreReader for ReadTransaction<'_> {
         use crate::schema::{accounts, confidential_outputs, vaults};
 
         let rows = confidential_outputs::table
+            .inner_join(vaults::table.on(vaults::id.eq(confidential_outputs::vault_id)))
+            .inner_join(accounts::table.on(accounts::id.eq(confidential_outputs::account_id)))
+            .select((confidential_outputs::all_columns, accounts::address, vaults::address))
             .filter(confidential_outputs::lock_id.eq(lock_id))
-            .get_results::<models::ConfidentialOutput>(self.connection())
+            .get_results::<(models::ConfidentialOutput, String, String)>(self.connection())
             .map_err(|e| WalletStorageError::general(OPERATION, e))?;
 
-        if rows.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let vault_addresses = if rows.is_empty() {
-            HashMap::new()
-        } else {
-            let vec = vaults::table
-                .filter(vaults::id.eq_any(rows.iter().map(|v| v.vault_id)))
-                .select((vaults::id, vaults::address))
-                .get_results::<(i32, String)>(self.connection())
-                .map_err(|e| WalletStorageError::general("outputs_get_locked_by_proof", e))?;
-            vec.into_iter().collect()
-        };
-
-        // account_id should be the same in all rows
-        let account_address = rows
-            .first()
-            .map(|row| {
-                accounts::table
-                    .filter(accounts::id.eq(row.account_id))
-                    .select(accounts::address)
-                    .first::<String>(self.connection())
-                    .map_err(|e| WalletStorageError::general("outputs_get_locked_by_proof", e))
-            })
-            .transpose()?;
-
-        let confidential_outputs = rows
-            .into_iter()
-            .map(|row| {
-                let vault_id = row.vault_id;
-                row.try_into_output(
-                    account_address.as_ref().unwrap(),
-                    vault_addresses.get(&vault_id).unwrap(),
-                )
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(confidential_outputs)
+        rows.into_iter()
+            .map(|(row, account_address, vault_address)| row.try_into_output(&account_address, &vault_address))
+            .collect()
     }
 
     fn confidential_outputs_get_by_commitment(
@@ -1328,30 +1296,29 @@ impl WalletStoreReader for ReadTransaction<'_> {
         use crate::schema::{accounts, stealth_outputs};
 
         let rows = stealth_outputs::table
+            .inner_join(accounts::table.on(accounts::id.eq(stealth_outputs::owner_account_id)))
+            .select((stealth_outputs::all_columns, accounts::address))
             .filter(stealth_outputs::lock_id.eq(lock_id))
-            .get_results::<models::StealthOutput>(self.connection())
+            .get_results::<(models::StealthOutput, String)>(self.connection())
             .map_err(|e| WalletStorageError::general(OPERATION, e))?;
 
-        // account_id should be the same in all rows
-        let first_row = rows.first().ok_or_else(|| WalletStorageError::NotFound {
-            operation: OPERATION,
-            entity: "stealth_output".to_string(),
-            key: lock_id.to_string(),
-        })?;
-        let account_address = accounts::table
-            .filter(accounts::id.eq(first_row.owner_account_id))
-            .select(accounts::address)
-            .first::<String>(self.connection())
-            .map_err(|e| WalletStorageError::general(OPERATION, e))?;
-
-        let account_address = account_address.parse().map_err(|e| WalletStorageError::DecodingError {
-            operation: OPERATION,
-            item: "account",
-            details: format!("Corrupt db: invalid owner account address '{account_address}': {e}"),
-        })?;
+        if rows.is_empty() {
+            return Err(WalletStorageError::NotFound {
+                operation: OPERATION,
+                entity: "stealth_output".to_string(),
+                key: lock_id.to_string(),
+            });
+        }
 
         rows.into_iter()
-            .map(|row| row.try_convert(account_address))
+            .map(|(row, account_address)| {
+                let account_address = account_address.parse().map_err(|e| WalletStorageError::DecodingError {
+                    operation: OPERATION,
+                    item: "account",
+                    details: format!("Corrupt db: invalid owner account address '{account_address}': {e}"),
+                })?;
+                row.try_convert(account_address)
+            })
             .collect::<Result<_, _>>()
     }
 
@@ -2332,5 +2299,132 @@ mod tests {
             assert_eq!(list[0].id, id2);
             assert_eq!(list[0].label, "YubiKey 5C");
         }
+    }
+
+    #[test]
+    fn get_locked_by_lock_id_preserves_each_outputs_account_across_multiple_accounts() {
+        use std::collections::HashSet;
+
+        use tari_ootle_common_types::{Epoch, SubstateVersion};
+        use tari_ootle_wallet_crypto::EncryptedData;
+        use tari_ootle_wallet_sdk::models::{KeyBranch, KeyId, LockOwner};
+        use tari_template_lib_types::{
+            ResourceType,
+            crypto::{PedersenCommitmentBytes, RistrettoPublicKeyBytes, UtxoTag},
+            stealth::SpendAuthorization,
+        };
+
+        let store = SqliteWalletStore::try_open(":memory:").unwrap();
+        store.run_migrations().unwrap();
+
+        let acct_a = ComponentAddress::from_array([1u8; 32]);
+        let acct_b = ComponentAddress::from_array([2u8; 32]);
+        let vault_a = VaultId::new([10u8; 32].into());
+        let vault_b = VaultId::new([20u8; 32].into());
+        let resource = ResourceAddress::from_array([9u8; 32]);
+        let view_key = KeyId::derived(KeyBranch::ViewOnlyKey, 0);
+        let owner_key = Some(KeyId::derived(KeyBranch::Account, 0));
+        let encrypted_data = EncryptedData::try_from(vec![0u8; EncryptedData::min_size()]).unwrap();
+
+        let lock_id = {
+            let mut tx = store.create_write_tx().unwrap();
+            for (name, addr, vault) in [("a", acct_a, vault_a), ("b", acct_b, vault_b)] {
+                tx.accounts_insert(
+                    Some(name),
+                    &addr,
+                    view_key,
+                    owner_key,
+                    &RistrettoPublicKeyBytes::default(),
+                    &HashSet::new(),
+                    Epoch(0),
+                    true,
+                    false,
+                )
+                .unwrap();
+                tx.vaults_insert(VaultModel {
+                    account_address: addr,
+                    id: vault,
+                    vault_version: SubstateVersion::zero(),
+                    resource_address: resource,
+                    resource_type: ResourceType::Confidential,
+                    revealed_balance: Amount::ZERO,
+                    locked_revealed_balance: Amount::ZERO,
+                    confidential_balance: Amount::ZERO,
+                    token_symbol: None,
+                    divisibility: 0,
+                })
+                .unwrap();
+            }
+            let lock_id = tx.locks_create(None, LockOwner::User).unwrap();
+            for (byte, addr, vault) in [(1u8, acct_a, vault_a), (2u8, acct_b, vault_b)] {
+                tx.stealth_outputs_insert(&StealthOutputModel {
+                    owner_account: addr,
+                    resource_address: resource,
+                    commitment: PedersenCommitmentBytes::from_array([byte; 32]),
+                    value: 100,
+                    sender_public_nonce: RistrettoPublicKeyBytes::default(),
+                    view_only_key_id: view_key,
+                    owner_key_id: owner_key,
+                    encrypted_data: encrypted_data.clone(),
+                    tag_byte: UtxoTag::new(0),
+                    memo: None,
+                    auth: SpendAuthorization::Key(RistrettoPublicKeyBytes::default()),
+                    minimum_value_promise: 0,
+                    status: OutputStatus::LockedForSpend,
+                    is_burnt: false,
+                    is_frozen: false,
+                    is_on_chain: true,
+                    is_condition_spendable: true,
+                    lock_id: Some(lock_id),
+                    proven_up: None,
+                    spent_version: None,
+                })
+                .unwrap();
+                tx.confidential_outputs_insert(ConfidentialOutputModel {
+                    account_address: addr,
+                    vault_id: vault,
+                    commitment: PedersenCommitmentBytes::from_array([byte + 10; 32]),
+                    value: Amount::from(100u64),
+                    sender_public_nonce: None,
+                    view_only_key_id: view_key,
+                    owner_key_id: owner_key,
+                    encrypted_data: encrypted_data.clone(),
+                    public_asset_tag: None,
+                    memo: None,
+                    status: OutputStatus::LockedForSpend,
+                    lock_id: Some(lock_id),
+                })
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            lock_id
+        };
+
+        let mut tx = store.create_read_tx().unwrap();
+        let stealth = tx.stealth_outputs_get_locked_by_lock_id(lock_id).unwrap();
+        let stealth_by_commitment = stealth
+            .into_iter()
+            .map(|o| (o.commitment, o.owner_account))
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            stealth_by_commitment,
+            HashSet::from([
+                (PedersenCommitmentBytes::from_array([1u8; 32]), acct_a),
+                (PedersenCommitmentBytes::from_array([2u8; 32]), acct_b),
+            ])
+        );
+
+        let confidential = tx.confidential_outputs_get_locked_by_lock_id(lock_id).unwrap();
+        let confidential_by_commitment = confidential
+            .into_iter()
+            .map(|o| (o.commitment, o.account_address))
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            confidential_by_commitment,
+            HashSet::from([
+                (PedersenCommitmentBytes::from_array([11u8; 32]), acct_a),
+                (PedersenCommitmentBytes::from_array([12u8; 32]), acct_b),
+            ])
+        );
     }
 }
