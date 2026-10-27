@@ -2150,6 +2150,12 @@ pub async fn handle_create_stealth_transfer_statement(
             .into_iter()
             .zip(&statement.outputs_statement.outputs)
         {
+            // Only pure key-path outputs (PayTo::StealthPublicKey) returning to a local account are
+            // recorded as pending wallet change. Condition-gated outputs can be claimed by whoever
+            // satisfies the condition tree and must not offset inputs_total on approval cards.
+            if !matches!(created.auth, SpendAuthorization::Key(_)) {
+                continue;
+            }
             let dest_component = derive_component_address_from_public_key(
                 &ACCOUNT_TEMPLATE_ADDRESS,
                 requested.address.account_public_key(),
@@ -2177,7 +2183,7 @@ pub async fn handle_create_stealth_transfer_statement(
                     is_burnt: false,
                     is_frozen: false,
                     is_on_chain: false,
-                    is_condition_spendable: sdk.stealth_outputs_api().is_spendable_auth(&created.auth),
+                    is_condition_spendable: true,
                     lock_id: Some(lock.id()),
                     proven_up: None,
                     spent_version: None,
@@ -3245,6 +3251,139 @@ mod create_stealth_transfer_statement_handler_tests {
             );
             assert_eq!(stored.lock_id, Some(response.lock_id));
         }
+        // A script-path (PayTo::Conditions) output is not wallet change and must not be recorded.
+        let all_stored = test
+            .context
+            .wallet_sdk()
+            .stealth_outputs_api()
+            .utxos_get_many(&test.stealth_resource, Some(&test.account), None)
+            .unwrap();
+        assert!(
+            all_stored.iter().all(|o| o.commitment != *outputs[0].commitment()),
+            "a script-path output must not be recorded as wallet change"
+        );
+    }
+
+    #[tokio::test]
+    async fn chains_unconfirmed_wallet_outputs_across_statements_and_cleans_up_on_error() {
+        let test = setup().await;
+        let bearer = test.bearer(&test.transfer_and_read_scopes());
+        let initial = insert_valid_output(&test, 100);
+        let external_address = OotleAddress::new(
+            Network::LocalNet,
+            htlc_participant_key(7),
+            htlc_participant_key(8),
+        );
+
+        // A batch where the second statement fails must roll back the first statement's unconfirmed output.
+        let failing_batch = AccountsCreateStealthTransferStatementRequest {
+            requests: vec![
+                TransferStatementRequest {
+                    sender_account: test.account.into(),
+                    resource_address: test.stealth_resource,
+                    input_selection: InputSelection::Specific {
+                        utxo_addresses: vec![initial.to_utxo_address()],
+                    },
+                    outputs: vec![TransferOutput {
+                        address: account_ootle_address(&test),
+                        revealed_amount: Amount::zero(),
+                        blinded_amount: 100,
+                        memo: None,
+                        pay_to: PayTo::StealthPublicKey,
+                    }],
+                },
+                TransferStatementRequest {
+                    sender_account: test.account.into(),
+                    resource_address: test.stealth_resource,
+                    input_selection: InputSelection::Selection(UtxoInputSelection::PreferConfidential),
+                    outputs: vec![TransferOutput {
+                        address: account_ootle_address(&test),
+                        revealed_amount: Amount::zero(),
+                        blinded_amount: 500,
+                        memo: None,
+                        pay_to: PayTo::StealthPublicKey,
+                    }],
+                },
+            ],
+        };
+        handle_create_stealth_transfer_statement(&test.context, Some(&bearer), failing_batch)
+            .await
+            .expect_err("second statement exceeds available balance and must fail");
+        let after_fail = test
+            .context
+            .wallet_sdk()
+            .stealth_outputs_api()
+            .utxos_get_many(&test.stealth_resource, Some(&test.account), None)
+            .unwrap();
+        assert_eq!(after_fail.len(), 1);
+        assert!(matches!(after_fail[0].status, OutputStatus::Unspent));
+
+        // Now run a valid 2-statement batch: statement 0 sends 40 externally and 60 change to self;
+        // statement 1 selects and spends that 60 unconfirmed change output under the shared lock.
+        let valid_batch = AccountsCreateStealthTransferStatementRequest {
+            requests: vec![
+                TransferStatementRequest {
+                    sender_account: test.account.into(),
+                    resource_address: test.stealth_resource,
+                    input_selection: InputSelection::Specific {
+                        utxo_addresses: vec![initial.to_utxo_address()],
+                    },
+                    outputs: vec![
+                        TransferOutput {
+                            address: external_address,
+                            revealed_amount: Amount::zero(),
+                            blinded_amount: 40,
+                            memo: None,
+                            pay_to: PayTo::StealthPublicKey,
+                        },
+                        TransferOutput {
+                            address: account_ootle_address(&test),
+                            revealed_amount: Amount::zero(),
+                            blinded_amount: 60,
+                            memo: None,
+                            pay_to: PayTo::StealthPublicKey,
+                        },
+                    ],
+                },
+                TransferStatementRequest {
+                    sender_account: test.account.into(),
+                    resource_address: test.stealth_resource,
+                    input_selection: InputSelection::Selection(UtxoInputSelection::PreferConfidential),
+                    outputs: vec![TransferOutput {
+                        address: account_ootle_address(&test),
+                        revealed_amount: Amount::zero(),
+                        blinded_amount: 60,
+                        memo: None,
+                        pay_to: PayTo::StealthPublicKey,
+                    }],
+                },
+            ],
+        };
+        let response = handle_create_stealth_transfer_statement(&test.context, Some(&bearer), valid_batch)
+            .await
+            .expect("second statement should spend the first statement's unconfirmed change");
+        assert_eq!(response.statements.len(), 2);
+
+        let external_commitment = response.statements[0].outputs_statement.outputs[0].commitment();
+        let intermediate_commitment = response.statements[0].outputs_statement.outputs[1].commitment();
+        let final_commitment = response.statements[1].outputs_statement.outputs[0].commitment();
+
+        let all_after = test
+            .context
+            .wallet_sdk()
+            .stealth_outputs_api()
+            .utxos_get_many(&test.stealth_resource, Some(&test.account), None)
+            .unwrap();
+        assert!(
+            all_after.iter().all(|o| &o.commitment != external_commitment),
+            "external recipient output must not be recorded in the wallet store"
+        );
+        let intermediate = stored_output(&test, intermediate_commitment);
+        assert!(matches!(intermediate.status, OutputStatus::LockedForSpend));
+        assert!(!intermediate.is_on_chain);
+        let final_out = stored_output(&test, final_commitment);
+        assert!(matches!(final_out.status, OutputStatus::LockedUnconfirmed));
+        assert_eq!(final_out.lock_id, Some(response.lock_id));
     }
 
     /// Builds a balanced single-output request paying the whole of one 100-value input to `conditions`.
