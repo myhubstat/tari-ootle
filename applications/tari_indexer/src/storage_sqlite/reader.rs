@@ -38,6 +38,7 @@ use tari_ootle_storage::{Ordering, StorageError, consensus_models::EpochCheckpoi
 use tari_ootle_storage_sqlite::SqliteTransaction;
 use tari_ootle_transaction::{Transaction, TransactionId};
 use tari_sidechain::FixedHash;
+use tari_state_tree::TransitionAccumulator;
 use tari_template_lib_types::{
     Amount,
     Hash32,
@@ -54,8 +55,12 @@ use crate::{
     storage_sqlite::{
         models,
         models::{
+            CheckpointShardLeaf,
             EventRecord,
             KeyValue,
+            StagedAccumulator,
+            StagedAccumulatorRow,
+            StagedVersion,
             SubstateCacheRow,
             SubstateRecord,
             TemplateCatalogueEntry,
@@ -64,6 +69,7 @@ use crate::{
             VerifiedStateRootRow,
             WatchedSubstateEntry,
             WatchedSubstateRow,
+            decode_staged_accumulator,
         },
         serialization::{decode_committed, deserialize_hex_try_from, deserialize_json, serialize_hex},
     },
@@ -1002,6 +1008,103 @@ impl IndexerStoreReadTransaction for SqliteStoreReadTransaction<'_> {
             .into_iter()
             .map(|(shard, version)| (Shard::from(shard as u32), StateVersion::new(version as u64)))
             .collect())
+    }
+
+    fn staged_accumulators_tail(&mut self, shard: Shard, limit: usize) -> Result<Vec<StagedAccumulator>, StorageError> {
+        const OPERATION: &str = "staged_accumulators_tail";
+        use crate::storage_sqlite::schema::staged_versions;
+
+        let rows = staged_versions::table
+            .select((
+                staged_versions::state_version,
+                staged_versions::epoch,
+                staged_versions::transition_acc,
+                staged_versions::streamed_by,
+            ))
+            .filter(staged_versions::shard.eq(shard.as_u32() as i32))
+            .order_by(staged_versions::state_version.desc())
+            .limit(i64::try_from(limit).unwrap_or(i64::MAX))
+            .get_results::<StagedAccumulatorRow>(self.connection())
+            .map_err(|e| StorageError::QueryError {
+                reason: format!("{OPERATION}: {}", e),
+            })?;
+        rows.into_iter().rev().map(decode_staged_accumulator).collect()
+    }
+
+    fn checkpoint_shard_leaves_above(
+        &mut self,
+        shard: Shard,
+        state_version: StateVersion,
+        limit: usize,
+    ) -> Result<Vec<CheckpointShardLeaf>, StorageError> {
+        const OPERATION: &str = "checkpoint_shard_leaves_above";
+        use crate::storage_sqlite::schema::checkpoint_shard_leaves;
+
+        // Leaves above a verified version are of versions staged contiguously from a shard's first, so they stay far
+        // below 2^63 and compare correctly as `i64`.
+        let rows = checkpoint_shard_leaves::table
+            .select((
+                checkpoint_shard_leaves::state_version,
+                checkpoint_shard_leaves::transition_acc,
+            ))
+            .filter(checkpoint_shard_leaves::shard.eq(shard.as_u32() as i32))
+            .filter(checkpoint_shard_leaves::state_version.gt(state_version.as_u64() as i64))
+            .order_by(checkpoint_shard_leaves::state_version.asc())
+            .limit(i64::try_from(limit).unwrap_or(i64::MAX))
+            .get_results::<(i64, Vec<u8>)>(self.connection())
+            .map_err(|e| StorageError::QueryError {
+                reason: format!("{OPERATION}: {}", e),
+            })?;
+        rows.into_iter()
+            .map(|(state_version, transition_acc)| {
+                Ok(CheckpointShardLeaf {
+                    shard,
+                    state_version: StateVersion::new(state_version as u64),
+                    transition_acc: TransitionAccumulator::try_from_bytes(&transition_acc).map_err(|e| {
+                        StorageError::DataInconsistency {
+                            details: format!(
+                                "the checkpoint leaf of shard {shard} at v{state_version} has an invalid transition \
+                                 accumulator: {e}"
+                            ),
+                        }
+                    })?,
+                })
+            })
+            .collect()
+    }
+
+    fn staged_version_get(
+        &mut self,
+        shard: Shard,
+        state_version: StateVersion,
+    ) -> Result<Option<StagedVersion>, StorageError> {
+        const OPERATION: &str = "staged_version_get";
+        use crate::storage_sqlite::schema::staged_versions;
+
+        let row = staged_versions::table
+            .select((
+                (
+                    staged_versions::state_version,
+                    staged_versions::epoch,
+                    staged_versions::transition_acc,
+                    staged_versions::streamed_by,
+                ),
+                staged_versions::batch,
+            ))
+            .filter(staged_versions::shard.eq(shard.as_u32() as i32))
+            .filter(staged_versions::state_version.eq(state_version.as_u64() as i64))
+            .first::<(StagedAccumulatorRow, Vec<u8>)>(self.connection())
+            .optional()
+            .map_err(|e| StorageError::QueryError {
+                reason: format!("{OPERATION}: {}", e),
+            })?;
+        row.map(|(accumulator, batch)| {
+            Ok(StagedVersion {
+                accumulator: decode_staged_accumulator(accumulator)?,
+                batch,
+            })
+        })
+        .transpose()
     }
 
     fn list_template_catalogue(

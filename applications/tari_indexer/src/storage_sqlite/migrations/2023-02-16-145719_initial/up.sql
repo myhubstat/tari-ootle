@@ -140,14 +140,45 @@ CREATE INDEX utxos_resource_unspent_idx ON utxos (resource_address) WHERE is_spe
 -- Finds a resource's spent or burnt UTXOs by public nonce and tag, as fetching UTXOs by key does to report which of
 -- the requested outputs are spent. Queries must repeat this condition as SQL literals for SQLite to use the index.
 CREATE INDEX utxos_resource_public_nonce_utxo_tag_spent_idx ON utxos (resource_address, public_nonce, utxo_tag) WHERE is_spent = true OR is_burnt = true;
+-- Spent UTXOs by the epoch they were spent in, as the tombstone pruner reads them oldest first. Queries must repeat
+-- this condition as an SQL literal for SQLite to use the index.
+CREATE INDEX utxos_spent_epoch_idx ON utxos (epoch) WHERE is_spent = true;
 
--- Per shard, the state version at and below which this indexer may lack the tombstone of a spent UTXO. A shard's first
--- sync fetches only its live substates, so the spends before it are not seen. The UTXO stream asks a client resuming
--- from below a shard's horizon to resync it. A shard with no row has every tombstone.
+-- Per shard, the state version at and below which this indexer may lack the tombstone of a spent UTXO. A shard
+-- synced from its live substates rather than from its first version does not see the spends before them, and the
+-- tombstone pruner raises the horizon over every tombstone it deletes. The UTXO stream tells a client resuming from
+-- below a shard's horizon that its spends are incomplete. A shard with no row has every tombstone.
 create table utxo_tombstone_horizons
 (
     shard         int    not null primary key,
     state_version bigint not null
+);
+
+-- Streamed state versions that no quorum-verified shard leaf covers yet. Each is promoted to the indexed tables once a
+-- verified leaf matches the transition accumulator computed through it, and is discarded if one does not.
+create table staged_versions
+(
+    shard          int    not null,
+    state_version  bigint not null,
+    epoch          bigint not null,
+    -- The shard's transition accumulator after this version.
+    transition_acc blob   not null,
+    -- The peer id of the committee member that streamed the version.
+    streamed_by    blob   not null,
+    -- The version's length-delimited, prost-encoded `SubstateBatch` chunks, in the order they were streamed.
+    batch          blob   not null,
+    primary key (shard, state_version)
+);
+
+-- The shard leaves of every quorum-signed checkpoint stored, above each shard's last verified version. A stream
+-- catching up checks its staged versions against each in turn, so that no more than an epoch's versions are staged
+-- unchecked.
+create table checkpoint_shard_leaves
+(
+    shard          int    not null,
+    state_version  bigint not null,
+    transition_acc blob   not null,
+    primary key (shard, state_version)
 );
 
 -- Lightweight template metadata received from validators via the TEMPLATE_METADATA sync flag. This

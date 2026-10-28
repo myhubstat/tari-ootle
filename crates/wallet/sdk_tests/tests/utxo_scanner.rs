@@ -59,7 +59,7 @@ impl WalletNetworkInterface for ScriptedUtxoNetwork {
         panic!("ScriptedUtxoNetwork::query_substate called")
     }
 
-    async fn get_substates(&self, _: Vec<SubstateId>, _: bool) -> Result<FetchedSubstates, Self::Error> {
+    async fn get_substates(&self, _: &[SubstateId], _: bool) -> Result<FetchedSubstates, Self::Error> {
         panic!("ScriptedUtxoNetwork::get_substates called")
     }
 
@@ -177,6 +177,7 @@ fn start_of_shard(shard: Shard, max_state_version: u64, utxo: UtxoUnspent) -> Ut
             shard,
             max_state_version: StateVersion::from(max_state_version),
             has_more: false,
+            spends_incomplete: false,
         }),
         update: Some(WalletUtxoUpdate::Unspent(utxo)),
         eos: None,

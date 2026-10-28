@@ -132,10 +132,10 @@ where TSpec: WalletSdkSpec
             .vault_ids()
             .iter()
             .map(|vault_id| SubstateId::Vault(*vault_id))
-            .collect::<HashSet<_>>();
-        let latest_vaults = substate_api
-            .get_substates_from_network(vault_substate_ids.into_iter().collect())
-            .await?;
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let latest_vaults = substate_api.get_substates_from_network(&vault_substate_ids).await?;
         for vault_id in indexed_value.vault_ids() {
             let vault_substate_id = SubstateId::Vault(*vault_id);
             let Some(substate) = latest_vaults.get(&vault_substate_id) else {
@@ -306,7 +306,7 @@ where TSpec: WalletSdkSpec
             let mut substates = self
                 .wallet_sdk
                 .substate_api()
-                .get_substates_from_network(ids_to_fetch)
+                .get_substates_from_network(&ids_to_fetch)
                 .await?;
 
             let mut outputs = Vec::with_capacity(substates.len());
@@ -935,6 +935,30 @@ where TSpec: WalletSdkSpec
         Ok(())
     }
 
+    /// Proves each output the wallet holds on chain without a proof of any version, and records the proof. An output
+    /// held without a proof can use only a down proof to show its spend, which the network keeps for a limited
+    /// window. Outputs received while the wallet did not verify its indexer have none. The indexer serves only live
+    /// outputs, so one spent before this runs stays without a proof.
+    pub async fn prove_unproven_held_outputs(&self) -> Result<(), AccountMonitorError> {
+        if !self.wallet_sdk.sdk_config().indexer_trust.is_verify() {
+            return Ok(());
+        }
+        let addresses = self.wallet_sdk.stealth_outputs_api().get_unproven_held_addresses()?;
+        if addresses.is_empty() {
+            return Ok(());
+        }
+        let num_proven = self.prove_outputs(&addresses, Level::Debug).await?;
+        if num_proven < addresses.len() {
+            info!(
+                target: LOG_TARGET,
+                "{} of {} stealth outputs the wallet holds without a proof could not be proven. Their spends will need a down proof.",
+                addresses.len() - num_proven,
+                addresses.len()
+            );
+        }
+        Ok(())
+    }
+
     /// Proves each of `addresses` that the wallet holds without a proof of any version, and records the proof (see
     /// [`ProvenUp`](tari_ootle_wallet_sdk::models::ProvenUp)). A transaction's outputs are proven only through its
     /// receipt, which can commit before another shard group commits them, so it does not show a block the outputs were
@@ -959,38 +983,53 @@ where TSpec: WalletSdkSpec
         if unproven.is_empty() {
             return Ok(());
         }
+        self.prove_outputs(&unproven, Level::Warn).await?;
+        Ok(())
+    }
 
+    /// Proves each of `addresses` in one fetch and records each proof. Returns how many were proven. Each output that
+    /// is not proven is logged at `failure_level`.
+    async fn prove_outputs(
+        &self,
+        addresses: &[UtxoAddress],
+        failure_level: Level,
+    ) -> Result<usize, AccountMonitorError> {
         let reads = match self
             .wallet_sdk
             .substate_api()
-            .get_each_substate_from_network(unproven.iter().cloned().map(Into::into).collect())
+            .get_each_substate_from_network(&addresses.iter().cloned().map(Into::into).collect::<Vec<_>>())
             .await
         {
             Ok(reads) => reads,
             Err(err @ SubstateApiError::StoreError(_)) => return Err(err.into()),
             Err(err) => {
-                warn!(
+                log!(
                     target: LOG_TARGET,
-                    "⚠️ Could not prove {} stealth outputs the wallet received ({}). Their spends will need a down proof.",
-                    unproven.len(),
+                    failure_level,
+                    "⚠️ Could not prove {} stealth outputs the wallet holds ({}). Their spends will need a down proof.",
+                    addresses.len(),
                     err
                 );
-                return Ok(());
+                return Ok(0);
             },
         };
-        for (address, (_, read)) in unproven.iter().zip(reads) {
+        let stealth_outputs_api = self.wallet_sdk.stealth_outputs_api();
+        let mut num_proven = 0;
+        for (address, (_, read)) in addresses.iter().zip(reads) {
             match read {
                 Ok(ReadSubstate {
                     proven_up: Some(proven_up),
                     ..
                 }) => {
                     stealth_outputs_api.record_proven_up(address, proven_up)?;
+                    num_proven += 1;
                 },
                 Ok(_) => {},
                 Err(err @ SubstateApiError::StoreError(_)) => return Err(err.into()),
                 Err(err) => {
-                    warn!(
+                    log!(
                         target: LOG_TARGET,
+                        failure_level,
                         "⚠️ Could not prove stealth output {} ({}). Its spend will need a down proof.",
                         address,
                         err
@@ -998,7 +1037,7 @@ where TSpec: WalletSdkSpec
                 },
             }
         }
-        Ok(())
+        Ok(num_proven)
     }
 
     async fn add_vault_to_account_if_not_exist(
