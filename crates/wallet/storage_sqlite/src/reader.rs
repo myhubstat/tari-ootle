@@ -2306,9 +2306,10 @@ mod tests {
         use std::collections::HashSet;
 
         use tari_ootle_common_types::{Epoch, SubstateVersion};
-        use tari_ootle_wallet_crypto::EncryptedData;
         use tari_ootle_wallet_sdk::models::{KeyBranch, KeyId, LockOwner};
         use tari_template_lib_types::{
+            EncryptedData,
+            ObjectKey,
             ResourceType,
             crypto::{PedersenCommitmentBytes, RistrettoPublicKeyBytes, UtxoTag},
             stealth::SpendAuthorization,
@@ -2321,20 +2322,20 @@ mod tests {
         let acct_b = ComponentAddress::from_array([2u8; 32]);
         let vault_a = VaultId::new([10u8; 32].into());
         let vault_b = VaultId::new([20u8; 32].into());
-        let resource = ResourceAddress::from_array([9u8; 32]);
+        let resource = ResourceAddress::new(ObjectKey::from_array([9u8; ObjectKey::LENGTH]));
         let view_key = KeyId::derived(KeyBranch::ViewOnlyKey, 0);
         let owner_key = Some(KeyId::derived(KeyBranch::Account, 0));
         let encrypted_data = EncryptedData::try_from(vec![0u8; EncryptedData::min_size()]).unwrap();
 
         let lock_id = {
             let mut tx = store.create_write_tx().unwrap();
-            for (name, addr, vault) in [("a", acct_a, vault_a), ("b", acct_b, vault_b)] {
+            for (name, addr, vault, owner_pk) in [("a", acct_a, vault_a, 1u8), ("b", acct_b, vault_b, 2u8)] {
                 tx.accounts_insert(
                     Some(name),
                     &addr,
                     view_key,
                     owner_key,
-                    &RistrettoPublicKeyBytes::default(),
+                    &RistrettoPublicKeyBytes::from([owner_pk; 32]),
                     &HashSet::new(),
                     Epoch(0),
                     true,
@@ -2344,7 +2345,7 @@ mod tests {
                 tx.vaults_insert(VaultModel {
                     account_address: addr,
                     id: vault,
-                    vault_version: SubstateVersion::zero(),
+                    vault_version: SubstateVersion::new(0),
                     resource_address: resource,
                     resource_type: ResourceType::Confidential,
                     revealed_balance: Amount::ZERO,
@@ -2355,7 +2356,7 @@ mod tests {
                 })
                 .unwrap();
             }
-            let lock_id = tx.locks_create(None, LockOwner::User).unwrap();
+            let lock_id = tx.locks_create(None, LockOwner::Wallet).unwrap();
             for (byte, addr, vault) in [(1u8, acct_a, vault_a), (2u8, acct_b, vault_b)] {
                 tx.stealth_outputs_insert(&StealthOutputModel {
                     owner_account: addr,
