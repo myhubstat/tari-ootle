@@ -147,6 +147,8 @@ impl CommonSubmitArgs {
     }
 }
 
+/// Submit a transaction manifest. When the manifest defines its own fee instructions, `--max-fee` is ignored and
+/// `--fee-account` only selects the seal signer.
 #[derive(Debug, Args, Clone)]
 pub struct SubmitManifestArgs {
     manifest: PathBuf,
@@ -986,7 +988,9 @@ fn parse_blobs(blobs: Vec<String>) -> Result<HashMap<String, Blob>, anyhow::Erro
             anyhow::bail!("Invalid blob '{}': blob name cannot be empty", entry);
         }
         let bytes = fs::read(path).map_err(|err| anyhow!("Failed to read blob '{}' from '{}': {}", name, path, err))?;
-        result.insert(name.to_string(), Blob::new(bytes));
+        if result.insert(name.to_string(), Blob::new(bytes)).is_some() {
+            anyhow::bail!("Duplicate blob name '{}'", name);
+        }
     }
     Ok(result)
 }
@@ -1023,12 +1027,16 @@ mod tests {
 
     #[test]
     fn loads_cli_blob_files_and_attaches_to_unsigned_transaction() {
-        let dir = tempfile::tempdir().unwrap();
-        let blob_path = dir.path().join("template.wasm");
+        let blob_path = std::env::temp_dir().join(format!("tari_wallet_cli_blob_{}.wasm", std::process::id()));
         let wasm_bytes = vec![0x00, 0x61, 0x73, 0x6d];
         fs::write(&blob_path, &wasm_bytes).unwrap();
 
-        let blobs = parse_blobs(vec![format!("template_wasm={}", blob_path.display())]).unwrap();
+        let arg = format!("template_wasm={}", blob_path.display());
+        let dup_err = parse_blobs(vec![arg.clone(), arg.clone()]).unwrap_err();
+        assert!(dup_err.to_string().contains("Duplicate blob name"), "{dup_err}");
+
+        let blobs = parse_blobs(vec![arg]).unwrap();
+        let _ = fs::remove_file(&blob_path);
         let manifest = r#"
             fn main() {
                 let wasm = blob!("template_wasm");
@@ -1053,7 +1061,7 @@ mod tests {
         assert_eq!(tx.blobs()[0].as_slice(), wasm_bytes.as_slice());
         tx.validate_blob_references().unwrap();
         assert_eq!(tx.min_epoch(), Some(Epoch(5)));
-        assert_eq!(tx.max_epoch(), Some(Epoch(15)));
+        assert_eq!(tx.max_epoch(), Epoch(15));
     }
 
     #[test]
