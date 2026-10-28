@@ -412,7 +412,7 @@ fn transition(
 /// The wallet-computed view of a request, including what it moves.
 fn to_info(context: &HandlerContext, model: TransactionRequestModel) -> Result<TransactionRequestInfo, anyhow::Error> {
     let status = model.effective_status_now();
-    let value_summaries = value_summaries(context, &model.unsigned_transaction, status, &model.lock_ids)?;
+    let value_summaries = value_summaries(context, &model.unsigned_transaction, model.status, &model.lock_ids)?;
 
     let main_signer = resolve_main_signer(context, &model.unsigned_transaction, &model.other_signers)?;
     let external_signers = model.signatures.iter().map(|sig| *sig.public_key()).collect();
@@ -464,7 +464,7 @@ fn resolve_main_signer(
 fn value_summaries(
     context: &HandlerContext,
     transaction: &UnsignedTransaction,
-    status: EffectiveStatus,
+    status: TransactionRequestStatus,
     lock_ids: &[WalletLockId],
 ) -> Result<Vec<TransactionRequestValueSummary>, anyhow::Error> {
     // A workspace reference resolves only at execution, so its commitments
@@ -524,7 +524,10 @@ fn value_summaries(
         }
     }
 
-    let awaiting_submission = !matches!(status, EffectiveStatus::Submitted);
+    let before_submission = !matches!(
+        status,
+        TransactionRequestStatus::Submitting | TransactionRequestStatus::Submitted
+    );
     let mut change = HashSet::new();
     for (resource, created) in created {
         // An output under a workspace reference resolves its resource at execution time,
@@ -533,12 +536,14 @@ fn value_summaries(
             continue;
         };
         for output in wallet_outputs(Some(resource), *created.commitment()) {
-            // Change is a pending output recorded under one of the request's locks while the
-            // request awaits submission, spendable by the wallet's key alone, and created with
-            // exactly the authorisation and encrypted opening the wallet recorded. Once a
-            // request has been submitted, finalizing its lock promotes the change output to
-            // Unspent and clears lock_id, so the pending-lock check applies only beforehand.
-            let lock_and_status_match = !awaiting_submission ||
+            // Before submission, change is a pending output recorded under one of the request's
+            // locks; once submission begins or completes, finalizing the lock promotes the change
+            // output to Unspent and clears lock_id, so the pending-lock check applies only
+            // beforehand. Change is an output the wallet holds the spend key for alone, created
+            // with exactly the authorisation and encrypted opening the wallet recorded: a
+            // different `auth` hands the same commitment to whoever holds that key. An output the
+            // transaction also spends is not coming back.
+            let lock_and_status_match = !before_submission ||
                 (matches!(output.status, OutputStatus::LockedUnconfirmed) &&
                     output.lock_id.is_some_and(|id| lock_ids.contains(&id)));
             let returns_to_wallet = lock_and_status_match &&
@@ -1247,41 +1252,49 @@ mod tests {
         #[tokio::test]
         async fn change_is_an_output_created_exactly_as_the_wallet_recorded_it() {
             let wallet = Wallet::start().await;
-            let lock_id = lock_for(&wallet.daemon, owner_of(&wallet.daemon, &wallet.tool));
-            let mut input = wallet_output(2, 1_000_000, OutputStatus::LockedForSpend);
-            input.lock_id = Some(lock_id);
-            let mut change = wallet_output(3, 400_000, OutputStatus::LockedUnconfirmed);
-            change.lock_id = Some(lock_id);
+            let new_lock = || lock_for(&wallet.daemon, owner_of(&wallet.daemon, &wallet.tool));
+            let input = wallet_output(2, 1_000_000, OutputStatus::LockedForSpend);
             wallet.add_output(&input);
-            wallet.add_output(&change);
-
-            let mut redirected = as_statement_output(&change);
-            redirected.auth = SpendAuthorization::Key(RistrettoPublicKeyBytes::from_bytes(&[9; 32]).unwrap());
-            let mut not_ours = wallet_output(4, 300_000, OutputStatus::LockedUnconfirmed);
-            not_ours.lock_id = Some(lock_id);
-            not_ours.owner_key_id = None;
-            wallet.add_output(&not_ours);
-
             let spend = &[input.commitment];
+
+            let lock_a = new_lock();
+            let mut change = wallet_output(3, 400_000, OutputStatus::LockedUnconfirmed);
+            change.lock_id = Some(lock_a);
+            wallet.add_output(&change);
             assert_eq!(
                 wallet
-                    .totals(spend, vec![as_statement_output(&change)], vec![lock_id])
+                    .totals(spend, vec![as_statement_output(&change)], vec![lock_a])
                     .await,
                 (1_000_000, 400_000, 600_000)
             );
+
+            let lock_b = new_lock();
+            let mut redirected_out = wallet_output(12, 400_000, OutputStatus::LockedUnconfirmed);
+            redirected_out.lock_id = Some(lock_b);
+            wallet.add_output(&redirected_out);
+            let mut redirected = as_statement_output(&redirected_out);
+            redirected.auth = SpendAuthorization::Key(RistrettoPublicKeyBytes::from_bytes(&[9; 32]).unwrap());
             assert_eq!(
-                wallet.totals(spend, vec![redirected], vec![lock_id]).await,
+                wallet.totals(spend, vec![redirected], vec![lock_b]).await,
                 (1_000_000, 0, 1_000_000)
             );
+
+            let lock_c = new_lock();
+            let mut not_ours = wallet_output(4, 300_000, OutputStatus::LockedUnconfirmed);
+            not_ours.lock_id = Some(lock_c);
+            not_ours.owner_key_id = None;
+            wallet.add_output(&not_ours);
             assert_eq!(
                 wallet
-                    .totals(spend, vec![as_statement_output(&not_ours)], vec![lock_id])
+                    .totals(spend, vec![as_statement_output(&not_ours)], vec![lock_c])
                     .await,
                 (1_000_000, 0, 1_000_000)
             );
+
+            let lock_d = new_lock();
             assert_eq!(
                 wallet
-                    .totals(spend, vec![as_statement_output(&input)], vec![lock_id])
+                    .totals(spend, vec![as_statement_output(&input)], vec![lock_d])
                     .await,
                 (1_000_000, 0, 1_000_000),
                 "an output the transaction also spends was counted as change"
@@ -1292,6 +1305,7 @@ mod tests {
                 (6, OutputStatus::Spent),
                 (7, OutputStatus::LockedForSpend),
             ] {
+                let lock_id = new_lock();
                 let mut existing = wallet_output(n, 1_000_000, status);
                 existing.lock_id = Some(lock_id);
                 wallet.add_output(&existing);
@@ -1311,6 +1325,7 @@ mod tests {
                     SpendAuthorization::KeyAndScript(RistrettoPublicKeyBytes::default(), Hash32::zero()),
                 ),
             ] {
+                let lock_id = new_lock();
                 let mut script_gated = wallet_output(n, 400_000, OutputStatus::LockedUnconfirmed);
                 script_gated.lock_id = Some(lock_id);
                 script_gated.auth = auth;
@@ -1324,22 +1339,24 @@ mod tests {
                 );
             }
 
+            let held_lock = new_lock();
             let mut foreign_locked = wallet_output(10, 400_000, OutputStatus::LockedUnconfirmed);
-            foreign_locked.lock_id = Some(lock_for(&wallet.daemon, owner_of(&wallet.daemon, &wallet.tool)));
+            foreign_locked.lock_id = Some(new_lock());
             wallet.add_output(&foreign_locked);
             assert_eq!(
                 wallet
-                    .totals(spend, vec![as_statement_output(&foreign_locked)], vec![lock_id])
+                    .totals(spend, vec![as_statement_output(&foreign_locked)], vec![held_lock])
                     .await,
                 (1_000_000, 0, 1_000_000),
                 "an unconfirmed output from an unheld lock was counted as change"
             );
 
+            let held_lock_2 = new_lock();
             let unlocked_unconfirmed = wallet_output(11, 400_000, OutputStatus::LockedUnconfirmed);
             wallet.add_output(&unlocked_unconfirmed);
             assert_eq!(
                 wallet
-                    .totals(spend, vec![as_statement_output(&unlocked_unconfirmed)], vec![lock_id])
+                    .totals(spend, vec![as_statement_output(&unlocked_unconfirmed)], vec![held_lock_2])
                     .await,
                 (1_000_000, 0, 1_000_000),
                 "an unconfirmed output with no lock_id was counted as change"
@@ -1347,54 +1364,59 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn submitted_request_retains_change_summary_after_outputs_finalize() {
+        async fn submitted_or_submitting_request_retains_change_summary_after_outputs_finalize() {
             let wallet = Wallet::start().await;
             let input = wallet_output(2, 1_000_000, OutputStatus::Spent);
             let change = wallet_output(3, 400_000, OutputStatus::Unspent);
             wallet.add_output(&input);
             wallet.add_output(&change);
 
-            let tx = with_instructions(vec![stealth_transfer(
-                ResourceAddressRef::Address(resource()),
-                &[input.commitment],
-                vec![as_statement_output(&change)],
-            )]);
-            let mut req = create_request(vec![], 60 * 60);
-            req.transaction = tx;
-            let created = handle_create(&wallet.daemon.context, Some(&wallet.tool), req)
-                .await
-                .unwrap();
-            wallet
-                .daemon
-                .context
-                .wallet_sdk()
-                .store()
-                .with_write_tx(|tx| {
-                    tx.transaction_request_transition(
-                        created.request_id,
-                        &[TransactionRequestStatus::Pending],
-                        TransactionRequestStatus::Submitted,
-                    )
-                })
-                .unwrap();
+            for target_status in [
+                TransactionRequestStatus::Submitting,
+                TransactionRequestStatus::Submitted,
+            ] {
+                let tx = with_instructions(vec![stealth_transfer(
+                    ResourceAddressRef::Address(resource()),
+                    &[input.commitment],
+                    vec![as_statement_output(&change)],
+                )]);
+                let mut req = create_request(vec![], 60 * 60);
+                req.transaction = tx;
+                let created = handle_create(&wallet.daemon.context, Some(&wallet.tool), req)
+                    .await
+                    .unwrap();
+                wallet
+                    .daemon
+                    .context
+                    .wallet_sdk()
+                    .store()
+                    .with_write_tx(|tx| {
+                        tx.transaction_request_transition(
+                            created.request_id,
+                            &[TransactionRequestStatus::Pending],
+                            target_status,
+                        )
+                    })
+                    .unwrap();
 
-            let info = handle_get(
-                &wallet.daemon.context,
-                Some(&wallet.daemon.session),
-                TransactionRequestGetRequest {
-                    request_id: created.request_id,
-                },
-            )
-            .await
-            .unwrap()
-            .request;
-            let [summary] = info.value_summaries.as_slice() else {
-                panic!("expected one summary: {:?}", info.value_summaries);
-            };
-            assert_eq!(
-                (summary.inputs_total, summary.change_total, summary.amount_leaving),
-                (1_000_000, 400_000, 600_000)
-            );
+                let info = handle_get(
+                    &wallet.daemon.context,
+                    Some(&wallet.daemon.session),
+                    TransactionRequestGetRequest {
+                        request_id: created.request_id,
+                    },
+                )
+                .await
+                .unwrap()
+                .request;
+                let [summary] = info.value_summaries.as_slice() else {
+                    panic!("expected one summary: {:?}", info.value_summaries);
+                };
+                assert_eq!(
+                    (summary.inputs_total, summary.change_total, summary.amount_leaving),
+                    (1_000_000, 400_000, 600_000)
+                );
+            }
         }
 
         #[tokio::test]
