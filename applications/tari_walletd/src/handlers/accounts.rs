@@ -2625,13 +2625,14 @@ mod create_stealth_transfer_statement_handler_tests {
     };
     use tari_ootle_address::{Network, OotleAddress, RistrettoOotleAddress};
     use tari_ootle_common_types::Epoch;
+    use tari_ootle_transaction::{Instruction, ResourceAddressRef, TransactionBuilder};
     use tari_ootle_wallet_crypto::pay_to::PayTo;
     use tari_ootle_wallet_sdk::{
         IndexerTrust,
         WalletSdkConfig,
         apis::confidential_transfer::UtxoInputSelection,
         cipher_seed::CipherSeedRestore,
-        models::{EpochBirthday, KeyId},
+        models::{EpochBirthday, KeyId, WalletLockId},
     };
     use tari_ootle_wallet_sdk_services::{
         account_monitor::AccountMonitor,
@@ -2641,8 +2642,6 @@ mod create_stealth_transfer_statement_handler_tests {
         utxo_scanner::StealthUtxoScannerWorker,
     };
     use tari_ootle_wallet_storage_sqlite::SqliteWalletStore;
-    use tari_ootle_transaction::{Instruction, ResourceAddressRef, TransactionBuilder};
-    use tari_ootle_wallet_sdk::models::WalletLockId;
     use tari_ootle_walletd_client::{
         permissions::Permissions,
         types::{
@@ -2653,7 +2652,6 @@ mod create_stealth_transfer_statement_handler_tests {
             TransferStatementRequest,
         },
     };
-    use tari_template_lib_types::stealth::StealthTransferStatement;
     use tari_shutdown::Shutdown;
     use tari_template_lib_types::{
         ComponentAddress,
@@ -2704,7 +2702,7 @@ mod create_stealth_transfer_statement_handler_tests {
         /// Both scopes the Specific path requires: transfer-create and stealth-UTXO-read for this account.
         fn transfer_and_read_scopes(&self) -> String {
             format!(
-                "transfer:create:{account},stealth_utxos:read:{account},transaction_requests:create,transaction_requests:read",
+                "transfer:create:{account},stealth_utxos:read:{account}",
                 account = self.account
             )
         }
@@ -3274,7 +3272,6 @@ mod create_stealth_transfer_statement_handler_tests {
         );
         let summaries = statement_value_summaries(
             &test,
-            &bearer,
             response.statements[0].clone(),
             response.lock_id,
         )
@@ -3290,10 +3287,10 @@ mod create_stealth_transfer_statement_handler_tests {
 
     async fn statement_value_summaries(
         test: &StatementTest,
-        bearer: &Bearer,
         statement: StealthTransferStatement,
         lock_id: WalletLockId,
     ) -> Vec<TransactionRequestValueSummary> {
+        let bearer = test.bearer("transaction_requests:create,transaction_requests:read");
         let transaction = TransactionBuilder::new(Network::LocalNet.as_byte(), Epoch(100))
             .without_auto_fill_inputs()
             .with_instructions(vec![Instruction::StealthTransfer {
@@ -3304,7 +3301,7 @@ mod create_stealth_transfer_statement_handler_tests {
             .build_unsigned();
         let created = crate::handlers::transaction_requests::handle_create(
             &test.context,
-            Some(bearer),
+            Some(&bearer),
             TransactionRequestCreateRequest {
                 transaction,
                 seal_signer: KeyId::derived(KeyBranch::Account, 0),
@@ -3318,7 +3315,7 @@ mod create_stealth_transfer_statement_handler_tests {
         .unwrap();
         crate::handlers::transaction_requests::handle_get(
             &test.context,
-            Some(bearer),
+            Some(&bearer),
             TransactionRequestGetRequest {
                 request_id: created.request_id,
             },
@@ -3486,7 +3483,6 @@ mod create_stealth_transfer_statement_handler_tests {
         .unwrap();
         let summaries = statement_value_summaries(
             &test,
-            &bearer,
             single_res.statements[0].clone(),
             single_res.lock_id,
         )
