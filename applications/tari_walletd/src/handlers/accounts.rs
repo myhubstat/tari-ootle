@@ -2641,10 +2641,19 @@ mod create_stealth_transfer_statement_handler_tests {
         utxo_scanner::StealthUtxoScannerWorker,
     };
     use tari_ootle_wallet_storage_sqlite::SqliteWalletStore;
+    use tari_ootle_transaction::{Instruction, ResourceAddressRef, TransactionBuilder};
+    use tari_ootle_wallet_sdk::models::WalletLockId;
     use tari_ootle_walletd_client::{
         permissions::Permissions,
-        types::{InputSelection, TransferStatementRequest},
+        types::{
+            InputSelection,
+            TransactionRequestCreateRequest,
+            TransactionRequestGetRequest,
+            TransactionRequestValueSummary,
+            TransferStatementRequest,
+        },
     };
+    use tari_template_lib_types::stealth::StealthTransferStatement;
     use tari_shutdown::Shutdown;
     use tari_template_lib_types::{
         ComponentAddress,
@@ -2695,7 +2704,7 @@ mod create_stealth_transfer_statement_handler_tests {
         /// Both scopes the Specific path requires: transfer-create and stealth-UTXO-read for this account.
         fn transfer_and_read_scopes(&self) -> String {
             format!(
-                "transfer:create:{account},stealth_utxos:read:{account}",
+                "transfer:create:{account},stealth_utxos:read:{account},transaction_requests:create,transaction_requests:read",
                 account = self.account
             )
         }
@@ -3251,7 +3260,8 @@ mod create_stealth_transfer_statement_handler_tests {
             );
             assert_eq!(stored.lock_id, Some(response.lock_id));
         }
-        // A script-path (PayTo::Conditions) output is not wallet change and must not be recorded.
+        // A script-path (PayTo::Conditions) output is not wallet change and must not be recorded
+        // or counted toward change_total by transaction_requests value_summaries.
         let all_stored = test
             .context
             .wallet_sdk()
@@ -3262,6 +3272,61 @@ mod create_stealth_transfer_statement_handler_tests {
             all_stored.iter().all(|o| o.commitment != *outputs[0].commitment()),
             "a script-path output must not be recorded as wallet change"
         );
+        let summaries = statement_value_summaries(
+            &test,
+            &bearer,
+            response.statements[0].clone(),
+            response.lock_id,
+        )
+        .await;
+        let [summary] = summaries.as_slice() else {
+            panic!("expected one summary: {summaries:?}");
+        };
+        assert_eq!(
+            (summary.inputs_total, summary.change_total, summary.amount_leaving),
+            (250, 0, 250)
+        );
+    }
+
+    async fn statement_value_summaries(
+        test: &StatementTest,
+        bearer: &Bearer,
+        statement: StealthTransferStatement,
+        lock_id: WalletLockId,
+    ) -> Vec<TransactionRequestValueSummary> {
+        let transaction = TransactionBuilder::new(Network::LocalNet.as_byte(), Epoch(100))
+            .without_auto_fill_inputs()
+            .with_instructions(vec![Instruction::StealthTransfer {
+                resource_address_ref: ResourceAddressRef::Address(test.stealth_resource),
+                statement,
+                revealed_input_bucket: None,
+            }])
+            .build_unsigned();
+        let created = crate::handlers::transaction_requests::handle_create(
+            &test.context,
+            Some(bearer),
+            TransactionRequestCreateRequest {
+                transaction,
+                seal_signer: KeyId::derived(KeyBranch::Account, 0),
+                other_signers: vec![],
+                signatures: vec![],
+                lock_ids: vec![lock_id],
+                ttl_secs: Some(60),
+            },
+        )
+        .await
+        .unwrap();
+        crate::handlers::transaction_requests::handle_get(
+            &test.context,
+            Some(bearer),
+            TransactionRequestGetRequest {
+                request_id: created.request_id,
+            },
+        )
+        .await
+        .unwrap()
+        .request
+        .value_summaries
     }
 
     #[tokio::test]
@@ -3330,7 +3395,7 @@ mod create_stealth_transfer_statement_handler_tests {
                     },
                     outputs: vec![
                         TransferOutput {
-                            address: external_address,
+                            address: external_address.clone(),
                             revealed_amount: Amount::zero(),
                             blinded_amount: 40,
                             memo: None,
@@ -3384,6 +3449,55 @@ mod create_stealth_transfer_statement_handler_tests {
         let final_out = stored_output(&test, final_commitment);
         assert!(matches!(final_out.status, OutputStatus::LockedUnconfirmed));
         assert_eq!(final_out.lock_id, Some(response.lock_id));
+
+        // Verify end-to-end through transaction_requests value_summaries: a key-path self-output
+        // recorded by handle_create_stealth_transfer_statement counts toward change_total.
+        let single_input = insert_valid_output(&test, 100);
+        let single_res = handle_create_stealth_transfer_statement(
+            &test.context,
+            Some(&bearer),
+            AccountsCreateStealthTransferStatementRequest {
+                requests: vec![TransferStatementRequest {
+                    sender_account: test.account.into(),
+                    resource_address: test.stealth_resource,
+                    input_selection: InputSelection::Specific {
+                        utxo_addresses: vec![single_input.to_utxo_address()],
+                    },
+                    outputs: vec![
+                        TransferOutput {
+                            address: external_address,
+                            revealed_amount: Amount::zero(),
+                            blinded_amount: 40,
+                            memo: None,
+                            pay_to: PayTo::StealthPublicKey,
+                        },
+                        TransferOutput {
+                            address: account_ootle_address(&test),
+                            revealed_amount: Amount::zero(),
+                            blinded_amount: 60,
+                            memo: None,
+                            pay_to: PayTo::StealthPublicKey,
+                        },
+                    ],
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        let summaries = statement_value_summaries(
+            &test,
+            &bearer,
+            single_res.statements[0].clone(),
+            single_res.lock_id,
+        )
+        .await;
+        let [summary] = summaries.as_slice() else {
+            panic!("expected one summary: {summaries:?}");
+        };
+        assert_eq!(
+            (summary.inputs_total, summary.change_total, summary.amount_leaving),
+            (100, 60, 40)
+        );
     }
 
     /// Builds a balanced single-output request paying the whole of one 100-value input to `conditions`.
