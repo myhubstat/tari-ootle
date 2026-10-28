@@ -37,7 +37,7 @@ use tari_template_lib::types::{
     UtxoAddress,
     access_rules::AccessRule,
     crypto::PedersenCommitmentBytes,
-    stealth::{RevealedOutput, SpendAuthorization, StealthTransferStatement},
+    stealth::{RevealedOutput, SpendAuthorization, StealthTransferStatement, StealthUnspentOutput},
 };
 
 use crate::{
@@ -50,6 +50,7 @@ use crate::{
     },
     models::{
         AccountAndViewKeys,
+        AccountWithAddress,
         InputSpendData,
         KeyBranch,
         KeyId,
@@ -527,6 +528,41 @@ impl<'a, TSpec: WalletSdkSpec> StealthOutputsApi<'a, TSpec> {
         tx.stealth_outputs_insert(output)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Records an output that a statement built under `lock_id` creates for `account`. It stays `LockedUnconfirmed`
+    /// until the lock's transaction finalizes, and releasing the lock deletes it.
+    pub fn add_unconfirmed_output(
+        &self,
+        lock_id: WalletLockId,
+        account: &AccountWithAddress,
+        resource_address: ResourceAddress,
+        output: &StealthUnspentOutput,
+        value: u64,
+        memo: Option<Memo>,
+    ) -> Result<(), StealthOutputsApiError> {
+        self.add_output(&StealthOutputModel {
+            owner_account: *account.component_address(),
+            resource_address,
+            commitment: output.output.commitment,
+            value,
+            sender_public_nonce: output.output.sender_public_nonce,
+            view_only_key_id: account.view_only_key_id(),
+            owner_key_id: account.owner_key_id(),
+            encrypted_data: output.output.encrypted_data.clone(),
+            status: OutputStatus::LockedUnconfirmed,
+            memo,
+            auth: output.auth.clone(),
+            minimum_value_promise: output.output.minimum_value_promise,
+            tag_byte: output.tag,
+            lock_id: Some(lock_id),
+            proven_up: None,
+            spent_version: None,
+            is_burnt: false,
+            is_frozen: false,
+            is_on_chain: false,
+            is_condition_spendable: self.is_spendable_auth(&output.auth),
+        })
     }
 
     /// Whether the wallet can auto-select a UTXO with this authorisation as a spend input. Only key-path UTXOs (whose

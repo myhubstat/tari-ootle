@@ -50,6 +50,7 @@ use tari_ootle_transaction::{
     TransactionSignature,
     UnsignedTransaction,
 };
+pub use tari_ootle_wallet_sdk::apis::stealth_transfer::InputSelection;
 use tari_ootle_wallet_sdk::{
     IndexerTrust,
     apis::{
@@ -1955,45 +1956,6 @@ impl TransferStatementRequest {
         self.outputs
             .iter()
             .try_fold(Amount::zero(), |sum, o| sum.checked_add(o.total_output_amount()?))
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export, export_to = "wallet-types/"))]
-pub enum InputSelection {
-    FromBucket {
-        revealed_amount: Amount,
-    },
-    Selection(UtxoInputSelection),
-    /// Spend exactly the named wallet-owned stealth UTXOs, in the given order. The wallet resolves, validates and
-    /// locks precisely these outputs via `StealthOutputsApi::lock_specific_outputs`, rather than choosing inputs to
-    /// cover an amount.
-    Specific {
-        utxo_addresses: Vec<UtxoAddress>,
-    },
-}
-
-impl InputSelection {
-    pub fn as_selection(&self) -> Option<UtxoInputSelection> {
-        match self {
-            InputSelection::Selection(s) => Some(*s),
-            InputSelection::FromBucket { .. } | InputSelection::Specific { .. } => None,
-        }
-    }
-
-    pub fn as_from_bucket(&self) -> Option<Amount> {
-        match self {
-            InputSelection::FromBucket { revealed_amount } => Some(*revealed_amount),
-            InputSelection::Selection(_) | InputSelection::Specific { .. } => None,
-        }
-    }
-
-    /// The exact UTXOs to spend when this is an [`InputSelection::Specific`] selection.
-    pub fn as_specific(&self) -> Option<&[UtxoAddress]> {
-        match self {
-            InputSelection::Specific { utxo_addresses } => Some(utxo_addresses),
-            InputSelection::FromBucket { .. } | InputSelection::Selection(_) => None,
-        }
     }
 }
 
