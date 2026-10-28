@@ -153,8 +153,6 @@ impl<'a, TSpec: WalletSdkSpec> StealthTransferApi<'a, TSpec> {
             checked.push(self.check_statement_spec(spec).await?);
         }
 
-        let _permit = self.semaphore.acquire().await.expect("semaphore is never closed");
-
         let mut statements = Vec::with_capacity(specs.len());
         let mut signing_keys = Vec::new();
         let mut utxo_signers = Vec::new();
