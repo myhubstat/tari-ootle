@@ -1356,7 +1356,9 @@ mod tests {
             wallet.add_output(&unlocked_unconfirmed);
             assert_eq!(
                 wallet
-                    .totals(spend, vec![as_statement_output(&unlocked_unconfirmed)], vec![held_lock_2])
+                    .totals(spend, vec![as_statement_output(&unlocked_unconfirmed)], vec![
+                        held_lock_2
+                    ])
                     .await,
                 (1_000_000, 0, 1_000_000),
                 "an unconfirmed output with no lock_id was counted as change"
@@ -1432,11 +1434,9 @@ mod tests {
 
             let tx = with_instructions(vec![
                 stealth_transfer(ResourceAddressRef::Address(resource()), &[input.commitment], vec![]),
-                stealth_transfer(
-                    ResourceAddressRef::Workspace(WorkspaceOffsetId::new(0)),
-                    &[],
-                    vec![as_statement_output(&change)],
-                ),
+                stealth_transfer(ResourceAddressRef::Workspace(WorkspaceOffsetId::new(0)), &[], vec![
+                    as_statement_output(&change),
+                ]),
             ]);
             let info = wallet.info(tx, vec![lock_id]).await;
 
