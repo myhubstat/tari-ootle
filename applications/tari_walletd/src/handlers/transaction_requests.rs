@@ -1299,6 +1299,15 @@ mod tests {
                 (1_000_000, 0, 1_000_000),
                 "an output the transaction also spends was counted as change"
             );
+        }
+
+        #[tokio::test]
+        async fn change_is_a_pending_key_output_under_one_of_the_requests_locks() {
+            let wallet = Wallet::start().await;
+            let new_lock = || lock_for(&wallet.daemon, owner_of(&wallet.daemon, &wallet.tool));
+            let input = wallet_output(2, 1_000_000, OutputStatus::LockedForSpend);
+            wallet.add_output(&input);
+            let spend = &[input.commitment];
 
             for (n, status) in [
                 (5, OutputStatus::Unspent),
@@ -1320,10 +1329,10 @@ mod tests {
 
             for (n, auth) in [
                 (8, SpendAuthorization::Script(Hash32::zero())),
-                (
-                    9,
-                    SpendAuthorization::KeyAndScript(RistrettoPublicKeyBytes::default(), Hash32::zero()),
-                ),
+                (9, SpendAuthorization::KeyAndScript {
+                    spend_key: RistrettoPublicKeyBytes::default(),
+                    condition_root: Hash32::zero(),
+                }),
             ] {
                 let lock_id = new_lock();
                 let mut script_gated = wallet_output(n, 400_000, OutputStatus::LockedUnconfirmed);
